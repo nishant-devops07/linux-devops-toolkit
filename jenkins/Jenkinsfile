@@ -1,0 +1,777 @@
+@Library('jenkins-shared-library') _
+
+import java.text.SimpleDateFormat
+import java.util.Locale
+
+boolean isValidDdMmYy(String s) {
+    if (!(s ==~ /^\d{2}\.\d{2}\.\d{2}$/)) return false
+    def sdf = new SimpleDateFormat("dd.MM.yy", Locale.US)
+    sdf.setLenient(false)
+    try {
+        def d = sdf.parse(s)
+        return sdf.format(d) == s
+    } catch (Exception ignored) {
+        return false
+    }
+}
+
+boolean hasResolvedValue(Object value) {
+    def text = value?.toString()?.trim()
+    if (!text) return false
+
+    def lower = text.toLowerCase()
+    return lower != 'null' && !lower.startsWith('null ') && !lower.startsWith('null:')
+}
+
+void echoResolvedStatus(String label, Object value) {
+    def text = value?.toString()?.trim()
+    if (value == null) {
+        echo "${label}: null"
+    } else if (text == '') {
+        echo "${label}: empty string"
+    } else if (!hasResolvedValue(value)) {
+        echo "${label}: unresolved"
+    } else {
+        echo "${label}: present"
+    }
+}
+
+pipeline {
+    agent {
+        node {
+            label env.AGENT_LABEL?.trim() ? env.AGENT_LABEL.trim() : ''
+        }
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        timeout(time: 2, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        STAGE_RESULTS = "{}"
+        NVD_API_KEY   = credentials('nvd-api-key')
+    }
+
+    stages {
+
+        /* ─────────────────────────── Checkout ─────────────────────────── */
+        stage('Checkout') {
+            steps {
+                script {
+                    try {
+                        checkout scm
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Checkout failed: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────────── Initialize ───────────────────────── */
+        stage('Initialize') {
+            steps {
+                script {
+                    withFolderProperties {
+                        def targetEnv = ""
+                        def branch    = env.BRANCH_NAME?.trim() ?: ''
+
+                        if (!branch) {
+                            error("Initialize stage: BRANCH_NAME is empty. Cannot proceed.")
+                        }
+
+                        def sprintPattern = /^Sprint-Q[1-4]-(0[1-9]|[12][0-9]|3[01])\.(0[1-9]|1[0-2])\.\d{2}$/
+                        def isSprintBranch = (branch ==~ sprintPattern)
+
+                        env.EXECTIMEOUT = env.DEPLOYMENT_EXECTIMEOUT ?: "3600000"
+
+                        if (isSprintBranch || branch.equalsIgnoreCase("TimezoneDev")) {
+                            if (isSprintBranch) {
+                                def datePart = branch.replaceFirst(/^Sprint-Q[1-4]-/, "")
+                                if (!isValidDdMmYy(datePart)) {
+                                    error("Initialize stage: Invalid date in branch name → ${datePart}")
+                                }
+                            }
+                            targetEnv = "dev"
+                            env.TARGET_ENV = targetEnv
+
+                            echoResolvedStatus("Folder property DEV_BUILD_DEPLOYMENT_CMD", env.DEV_BUILD_DEPLOYMENT_CMD)
+
+                            def result = calculateVersion(targetEnv, branch)
+                            if (!result?.version?.trim()) {
+                                error("Initialize stage: Failed to calculate version for ${branch}/${targetEnv}")
+                            }
+                            env.NEW_VERSION  = result.version
+                            env.LAST_VERSION = result.previousVersion
+
+                            if (isSprintBranch) {
+                                env.CONFIG_NAME = env.DEV_CONFIG_NAME
+                            } else if (branch.equalsIgnoreCase("TimezoneDev")) {
+                                env.CONFIG_NAME = env.DEV_CONFIG_NAME_TIMEZONE
+                            }
+
+                            env.SONARQUBE_PROJECT_KEY       = env.DEV_SONARQUBE_PROJECT_KEY
+                            env.OWNERSHIP_CHANGE_CMD        = env.DEV_OWNERSHIP_CHANGE_CMD
+                            env.BUILD_OWNERSHIP_CHANGE_CMD  = env.DEV_BUILD_OWNERSHIP_CHANGE_CMD
+                            env.OWNERSHIP_REVERT_CMD        = env.DEV_OWNERSHIP_REVERT_CMD
+                            env.GIT_COMMAND                 = "${env.DEV_GIT_COMMAND} ${branch}"
+                            env.BUILD_GIT_COMMAND           = "${env.DEV_BUILD_GIT_COMMAND} ${branch}"
+                            env.DEPLOYMENT_CMD              = "${env.DEV_DEPLOYMENT_CMD} ${env.NEW_VERSION}"
+                            env.BUILD_DEPLOYMENT_CMD        = "${env.DEV_BUILD_DEPLOYMENT_CMD} ${env.NEW_VERSION}"
+                            env.NEXUS_PUSH                  = "${env.DEV_NEXUS_PUSH} ${env.NEW_VERSION}"
+                            env.BUILD_NEXUS_PUSH            = "${env.DEV_BUILD_NEXUS_PUSH}:${env.NEW_VERSION}"
+                            env.DOCKER_CLEANUP              = "${env.DEV_DOCKER_CLEANUP} ${env.LAST_VERSION}"
+                            env.BUILD_DOCKER_CLEANUP        = "${env.DEV_BUILD_DOCKER_CLEANUP} ${env.LAST_VERSION}"
+                            env.DEPLOYMENT_REMOTE_DIRECTORY = "${env.DEV_DEPLOYMENT_REMOTE_DIRECTORY}"
+                            env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY = "${env.DEV_BUILD_DEPLOYMENT_REMOTE_DIRECTORY}"
+
+                        } else if (branch.equalsIgnoreCase('UAT')) {
+                            targetEnv = "uat"
+                            env.TARGET_ENV = targetEnv
+
+                            echoResolvedStatus("Folder property UAT_BUILD_DEPLOYMENT_CMD", env.UAT_BUILD_DEPLOYMENT_CMD)
+
+                            def result = calculateVersion(targetEnv, branch)
+                            if (!result?.version?.trim()) {
+                                error("Initialize stage: Failed to calculate version for ${branch}/${targetEnv}")
+                            }
+                            env.NEW_VERSION  = result.version
+                            env.LAST_VERSION = result.previousVersion
+
+                            env.CONFIG_NAME                 = env.UAT_CONFIG_NAME
+                            env.SONARQUBE_PROJECT_KEY       = env.UAT_SONARQUBE_PROJECT_KEY
+                            env.OWNERSHIP_CHANGE_CMD        = env.UAT_OWNERSHIP_CHANGE_CMD
+                            env.BUILD_OWNERSHIP_CHANGE_CMD  = env.UAT_BUILD_OWNERSHIP_CHANGE_CMD
+                            env.OWNERSHIP_REVERT_CMD        = env.UAT_OWNERSHIP_REVERT_CMD
+                            env.GIT_COMMAND                 = "${env.UAT_GIT_COMMAND} ${branch}"
+                            env.BUILD_GIT_COMMAND           = "${env.UAT_BUILD_GIT_COMMAND} ${branch}"
+                            env.DEPLOYMENT_CMD              = "${env.UAT_DEPLOYMENT_CMD} ${env.NEW_VERSION}"
+                            env.BUILD_DEPLOYMENT_CMD        = "${env.UAT_BUILD_DEPLOYMENT_CMD} ${env.NEW_VERSION}"
+                            env.NEXUS_PUSH                  = "${env.UAT_NEXUS_PUSH} ${env.NEW_VERSION}"
+                            env.BUILD_NEXUS_PUSH            = "${env.UAT_BUILD_NEXUS_PUSH} ${env.NEW_VERSION}"
+                            env.DOCKER_CLEANUP              = "${env.UAT_DOCKER_CLEANUP} ${env.LAST_VERSION}"
+                            env.BUILD_DOCKER_CLEANUP        = "${env.UAT_BUILD_DOCKER_CLEANUP} ${env.LAST_VERSION}"
+                            env.DEPLOYMENT_REMOTE_DIRECTORY = "${env.UAT_DEPLOYMENT_REMOTE_DIRECTORY}"
+                            env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY = "${env.UAT_BUILD_DEPLOYMENT_REMOTE_DIRECTORY}"
+
+                        } else if (branch.equalsIgnoreCase('PROD')) {
+                            targetEnv = "prod"
+                            env.TARGET_ENV = targetEnv
+
+                            echoResolvedStatus("Folder property PROD_BUILD_DEPLOYMENT_CMD", env.PROD_BUILD_DEPLOYMENT_CMD)
+
+                            def result = calculateVersion(targetEnv, branch)
+                            if (!result?.version?.trim()) {
+                                error("Initialize stage: Failed to calculate version for ${branch}/${targetEnv}")
+                            }
+                            env.NEW_VERSION  = result.version
+                            env.LAST_VERSION = result.previousVersion
+
+                            env.CONFIG_NAME                 = env.PROD_CONFIG_NAME
+                            env.SONARQUBE_PROJECT_KEY       = env.PROD_SONARQUBE_PROJECT_KEY
+                            env.OWNERSHIP_CHANGE_CMD        = env.PROD_OWNERSHIP_CHANGE_CMD
+                            env.BUILD_OWNERSHIP_CHANGE_CMD  = env.PROD_BUILD_OWNERSHIP_CHANGE_CMD
+                            env.OWNERSHIP_REVERT_CMD        = env.PROD_OWNERSHIP_REVERT_CMD
+                            env.GIT_COMMAND                 = "${env.PROD_GIT_COMMAND} ${branch}"
+                            env.BUILD_GIT_COMMAND           = "${env.PROD_BUILD_GIT_COMMAND} ${branch}"
+                            env.DEPLOYMENT_CMD              = "${env.PROD_DEPLOYMENT_CMD} ${env.NEW_VERSION}"
+                            env.BUILD_DEPLOYMENT_CMD        = "${env.PROD_BUILD_DEPLOYMENT_CMD} ${env.NEW_VERSION}"
+                            env.NEXUS_PUSH                  = "${env.PROD_NEXUS_PUSH} ${env.NEW_VERSION}"
+                            env.BUILD_NEXUS_PUSH            = "${env.PROD_BUILD_NEXUS_PUSH} ${env.NEW_VERSION}"
+                            env.DOCKER_CLEANUP              = "${env.PROD_DOCKER_CLEANUP} ${env.LAST_VERSION}"
+                            env.BUILD_DOCKER_CLEANUP        = "${env.PROD_BUILD_DOCKER_CLEANUP} ${env.LAST_VERSION}"
+                            env.NEXUS_CLEANUP               = "${env.PROD_NEXUS_CLEANUP} ${env.NEW_VERSION}"
+                            env.DEPLOYMENT_REMOTE_DIRECTORY = "${env.PROD_DEPLOYMENT_REMOTE_DIRECTORY}"
+                            env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY = "${env.PROD_BUILD_DEPLOYMENT_REMOTE_DIRECTORY}"
+
+                        } else {
+                            error("Initialize stage: Unsupported branch mapping → ${branch}")
+                        }
+
+                        echo "Resolved CONFIG_NAME: ${env.CONFIG_NAME}"
+                        echo "Previous Version → ${env.LAST_VERSION}"
+                        echo "Calculated ${targetEnv} version → ${env.NEW_VERSION}"
+                    }
+                }
+
+                echo "================ DEPLOYMENT AUDIT ================"
+                echo "Branch Type      : ${env.BRANCH_NAME}"
+                echo "Environment Type : ${env.TARGET_ENV}"
+                echo "SSH Config Name  : ${env.CONFIG_NAME}"
+                echo "Deploy Directory : ${env.DEPLOYMENT_REMOTE_DIRECTORY}"
+                echo "GIT_COMMAND      : ${env.GIT_COMMAND}"
+                echo "Deploy Docker    : ${env.DEPLOYMENT_CMD}"
+                echo "Nexus Push Cmd   : ${env.NEXUS_PUSH}"
+                echo "=================================================="
+
+
+                echo "================ BUILDER DEPLOYMENT AUDIT ================"
+                echo "Branch Type      : ${env.BRANCH_NAME}"
+                echo "Environment Type : ${env.TARGET_ENV}"
+                echo "SSH Config Name  : ${env.CONFIG_NAME}"
+                echo "Deploy Directory : ${env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY}"
+                echo "GIT_COMMAND      : ${env.BUILD_GIT_COMMAND}"
+                echo "Deploy Docker    : ${env.BUILD_DEPLOYMENT_CMD}"
+                echo "Nexus Push Cmd   : ${env.BUILD_NEXUS_PUSH}"
+                echo "=================================================="
+            }
+        }
+
+        /* ─────────────────────────── Unit Test ────────────────────────── */
+        stage('Unit Test') {
+            steps {
+                script {
+                    try {
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: """
+                                            cd ${env.DEPLOYMENT_REMOTE_DIRECTORY}/app/node
+                                            if npm test; then
+                                                echo "✅ Unit tests PASSED"
+                                            else
+                                                echo "⚠️ Unit tests FAILED (non-blocking)"
+                                            fi
+                                            exit 0
+                                        """,
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 120000
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                        // SSH plugin may flip build to UNSTABLE on non-zero exit codes.
+                        // Since unit-test failures are intentionally non-blocking, reset here.
+                        if (currentBuild.result == 'UNSTABLE') {
+                            echo "⚠️ SSH plugin marked build UNSTABLE after Unit Test — resetting to SUCCESS (non-blocking stage)."
+                            currentBuild.result = null
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ Unit Test stage threw an exception (non-blocking): ${e.getMessage()}"
+                        currentBuild.result = null   // reset — unit tests must not block the pipeline
+                    }
+                }
+            }
+        }
+
+        // /* ─────────────────────── SonarQube Analysis ───────────────────── */
+        stage('SonarQube Analysis') {
+            environment {
+                SCANNER_HOME = tool 'SonarQube Scanner'
+            }
+            steps {
+                dir("${env.WORKSPACE}") {
+                    withCredentials([string(credentialsId: 'Jenkins_Sonarqube', variable: 'SONAR_TOKEN')]) {
+                        withSonarQubeEnv('SonarQube Scanner') {
+                            sh """
+                                ${SCANNER_HOME}/bin/sonar-scanner \
+                                  -Dsonar.projectKey=${env.SONARQUBE_PROJECT_KEY} \
+                                  -Dsonar.sources=. \
+                                  -Dsonar.host.url=https://sonarqube.proeffico.com \
+                                  -Dsonar.login=$SONAR_TOKEN \
+                                  -Dsonar.sourceEncoding=UTF-8 \
+                                  -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/modules/**,**/libraries/**,**/dependency-check-report.html
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // /* ─────────────────────── Quality Gate ─────────────────────────── */
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 1, unit: 'HOURS') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        /* ─────────────────────── OWASP Scan ───────────────────────────── */
+       
+    //    stage('OWASP Scan') {
+    //        steps {
+    //            dependencyCheck(
+    //                additionalArguments: "--nvdApiKey ${NVD_API_KEY} --scan . --format XML --format HTML",
+    //                odcInstallation: 'dependency-check'
+    //            )
+    //        }
+    //    }
+
+        // ─────────────────────── OWASP Publish ────────────────────────── 
+       // stage('OWASP Publish Report') {
+       //     steps {
+       //         dependencyCheckPublisher(pattern: '**/dependency-check-report.xml')
+       //     }
+       // }
+		//*/
+ 
+        /* ─────────────────────── Set File Permissions ──────────────────── */
+        stage('Set File Permissions') {
+            steps {
+                script {
+                    try {
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: "${env.OWNERSHIP_CHANGE_CMD}",
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 120000
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                        if (currentBuild.result == 'UNSTABLE') {
+                            currentBuild.result = null
+                            error("❌ Set File Permissions marked UNSTABLE by SSH plugin — failing stage.")
+                        }
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Set File Permissions failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+        stage('Build Server') {
+            when {
+                beforeAgent true
+                expression {
+                    def buildEnvPrefix = env.TARGET_ENV?.toString()?.trim()?.toUpperCase()
+                    def requiredBuildValues = [
+                        [name: 'BUILD_DEPLOYMENT_REMOTE_DIRECTORY', source: "${buildEnvPrefix}_BUILD_DEPLOYMENT_REMOTE_DIRECTORY", value: env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY],
+                        [name: 'BUILD_OWNERSHIP_CHANGE_CMD',       source: "${buildEnvPrefix}_BUILD_OWNERSHIP_CHANGE_CMD",       value: env.BUILD_OWNERSHIP_CHANGE_CMD],
+                        [name: 'BUILD_DEPLOYMENT_CMD',             source: "${buildEnvPrefix}_BUILD_DEPLOYMENT_CMD",             value: env.BUILD_DEPLOYMENT_CMD],
+                        [name: 'BUILD_NEXUS_PUSH',                 source: "${buildEnvPrefix}_BUILD_NEXUS_PUSH",                 value: env.BUILD_NEXUS_PUSH],
+                        [name: 'BUILD_DOCKER_CLEANUP',             source: "${buildEnvPrefix}_BUILD_DOCKER_CLEANUP",             value: env.BUILD_DOCKER_CLEANUP],
+                        [name: 'BUILD_GIT_COMMAND',                source: "${buildEnvPrefix}_BUILD_GIT_COMMAND",                value: env.BUILD_GIT_COMMAND]
+                    ]
+
+                    def missingBuildValues = requiredBuildValues.findAll { item ->
+                        !hasResolvedValue(item.value)
+                    }
+
+                    if (missingBuildValues) {
+                        echo "Build Server skipped. Failed env checks:"
+                        missingBuildValues.each { item ->
+                            def valueText = item.value?.toString()?.trim()
+                            if (item.value == null) {
+                                echo " - ${item.name}: null (check ${item.source})"
+                            } else if (valueText == '') {
+                                echo " - ${item.name}: empty string (check ${item.source})"
+                            } else if (valueText.toLowerCase().startsWith('null ')) {
+                                echo " - ${item.name}: starts with null before appended argument (check ${item.source})"
+                            } else if (valueText.toLowerCase().startsWith('null:')) {
+                                echo " - ${item.name}: starts with null before appended tag/version (check ${item.source})"
+                            } else {
+                                echo " - ${item.name}: unresolved value (check ${item.source})"
+                            }
+                        }
+
+                        return false
+                    }
+
+                    return true
+                }
+            }
+
+            agent { label "${env.BUILD_NODE}" }
+
+            stages {
+
+                stage('Checkout') {
+                    steps {
+                        checkout scm
+                        echo "Build Server: ${env.BUILD_SERVER}"
+                        echo "Running commands from:"
+                        sh 'pwd && hostname -I'
+                        sh "cd ${env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY} && pwd"
+                        echo "DEPLOYMENT_REMOTE_DIRECTORY: ${env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY}"
+                    }
+                }
+
+                stage('Version Control Operations') {
+                    steps {
+                        sh """
+                            echo "Running commands from:"
+                            cd "${env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY}"
+                            pwd
+                            echo "🔀 Running Build Git Commands: ${env.BUILD_GIT_COMMAND}"
+                            ${env.BUILD_GIT_COMMAND}
+                        """
+                    }
+                }
+
+                stage('Set File Permissions') {
+                    steps {
+                        sh "${env.BUILD_OWNERSHIP_CHANGE_CMD}"
+                        echo "Running commands from:"
+                        sh 'pwd'
+                        echo "Build Server: ${env.BUILD_SERVER}"
+                    }
+                }
+
+                stage('Build Image') {
+                    steps {
+                        sh """
+                            echo "Running commands from:" && pwd
+                            echo "Building image ${env.IMAGE} with version ${env.NEW_VERSION}"
+                            ${env.BUILD_DEPLOYMENT_CMD}
+                        """
+                    }
+                }
+                stage('Build Nexus Push') {
+                    steps {
+                        sh """
+                            echo "Running commands from:" && pwd
+                            echo "Uploading ${env.IMAGE} with version ${env.NEW_VERSION}"
+                            echo "${env.BUILD_NEXUS_PUSH}"
+                            ${env.BUILD_NEXUS_PUSH}
+                        """
+                    }
+                }
+                stage('Container Cleanup') {
+                    when {
+                        allOf {
+                            expression { env.LAST_VERSION?.trim() }
+                            expression { currentBuild.currentResult == 'SUCCESS' }
+                        }
+                    }
+                    steps {
+                        script {
+                            echo "🧹 Running Docker cleanup: ${env.BUILD_DOCKER_CLEANUP}"
+                            try {
+                                sh """
+                                    echo "Running commands from:"
+                                    cd "${env.BUILD_DEPLOYMENT_REMOTE_DIRECTORY}"
+                                    pwd
+                                    ${env.BUILD_DOCKER_CLEANUP}
+                                """
+                            } catch (Exception e) {
+                                // Cleanup failure must not fail the overall build
+                                echo "⚠️ Container Cleanup failed (non-blocking): ${e.getMessage()}"
+                                currentBuild.result = null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Version Control Operations ───────────── */
+        stage('Version Control Operations') {
+            when {
+                expression {
+                    hasResolvedValue(env.GIT_COMMAND)
+                }
+            }
+            steps {
+                script {
+                    echo "🔀 Running Git Commands: ${env.GIT_COMMAND}"
+                    try {
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: "${env.GIT_COMMAND}",
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 120000,
+                                        remoteDirectory: "${env.DEPLOYMENT_REMOTE_DIRECTORY}"
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                        if (currentBuild.result == 'UNSTABLE') {
+                            currentBuild.result = null
+                            error("❌ Version Control Operations marked UNSTABLE by SSH plugin — failing stage explicitly.")
+                        }
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Git Commands failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Application Deployment ───────────────── */
+        stage('Application Deployment') {
+            steps {
+                script {
+                    echo "🚀 Deploying using command: ${env.DEPLOYMENT_CMD}"
+                    try {
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: """
+                                            export IMAGE_TAG=${env.NEW_VERSION}
+                                            ${env.DEPLOYMENT_CMD}
+                                        """,
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 3600000,
+                                        remoteDirectory: "${env.DEPLOYMENT_REMOTE_DIRECTORY}"
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                        if (currentBuild.result == 'UNSTABLE') {
+                            currentBuild.result = null
+                            error("❌ Application Deployment marked UNSTABLE by SSH plugin — failing stage.")
+                        }
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Deployment failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Container Cleanup ─────────────────────── */
+        stage('Container Cleanup') {
+            when {
+                allOf {
+                    expression { env.LAST_VERSION?.trim() }
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                }
+            }
+            steps {
+                script {
+                    echo "🧹 Running Docker cleanup: ${env.DOCKER_CLEANUP}"
+                    try {
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: "${env.DOCKER_CLEANUP}",
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 120000,
+                                        remoteDirectory: "${env.DEPLOYMENT_REMOTE_DIRECTORY}"
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                        if (currentBuild.result == 'UNSTABLE') {
+                            echo "⚠️ Container Cleanup marked UNSTABLE — resetting (non-critical stage)."
+                            currentBuild.result = null
+                        }
+                    } catch (Exception e) {
+                        // Cleanup failure must not fail the overall build
+                        echo "⚠️ Container Cleanup failed (non-blocking): ${e.getMessage()}"
+                        currentBuild.result = null
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Publish Artifact (Nexus) ─────────────── */
+        stage('Publish Artifact') {
+            when {
+                allOf {
+                    branch 'PROD'
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                    expression { env.NEW_VERSION?.trim() }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        if (!env.CONFIG_NAME?.trim())  { error("CONFIG_NAME is empty") }
+                        if (!env.NEXUS_PUSH?.trim())   { error("NEXUS_PUSH command is empty") }
+
+                        echo "📦 Nexus Push Command  → ${env.NEXUS_PUSH}"
+                        echo "Target Server          → ${env.CONFIG_NAME}"
+                        echo "Remote Directory       → ${env.DEPLOYMENT_REMOTE_DIRECTORY}"
+
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: "${env.NEXUS_PUSH}",
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 120000,
+                                        remoteDirectory: env.DEPLOYMENT_REMOTE_DIRECTORY
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                        if (currentBuild.result == 'UNSTABLE') {
+                            currentBuild.result = null
+                            error("❌ Publish Artifact marked UNSTABLE by SSH plugin — failing stage.")
+                        }
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Nexus Push failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Artifact Cleanup (Nexus) ─────────────── */
+        stage('Artifact Cleanup') {
+            when {
+                allOf {
+                    branch 'PROD'
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                    expression { env.LAST_VERSION?.trim() }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        if (!env.CONFIG_NAME?.trim())   { error("CONFIG_NAME is empty") }
+                        if (!env.NEXUS_CLEANUP?.trim()) { error("NEXUS_CLEANUP command is empty") }
+                        if (!env.LAST_VERSION?.trim())  { error("LAST_VERSION is empty — refusing to cleanup") }
+
+                        echo "🗑️  Nexus Cleanup Command → ${env.NEXUS_CLEANUP}"
+                        echo "Version to Cleanup       → ${env.LAST_VERSION}"
+                        echo "Target Server            → ${env.CONFIG_NAME}"
+
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: env.NEXUS_CLEANUP,
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 120000,
+                                        remoteDirectory: env.DEPLOYMENT_REMOTE_DIRECTORY
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                        if (currentBuild.result == 'UNSTABLE') {
+                            currentBuild.result = null
+                            error("❌ Artifact Cleanup marked UNSTABLE by SSH plugin — failing stage.")
+                        }
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Nexus Cleanup failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Create Release Tag ───────────────────── */
+        stage('Create Release Tag') {
+            when {
+                allOf {
+                    branch 'PROD'
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        tagRelease(env.NEW_VERSION)
+                        echo "✅ Git tag created: ${env.NEW_VERSION}"
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Tag Release failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Publish GitHub Release ───────────────── */
+        stage('Publish Release') {
+            when {
+                allOf {
+                    branch 'PROD'
+                    expression { currentBuild.currentResult == 'SUCCESS' }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        gitHubRelease(env.NEW_VERSION)
+                        echo "✅ GitHub release created: ${env.NEW_VERSION}"
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ GitHub Release failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+        /* ─────────────────────── Update Version Metadata ──────────────── */
+        stage('Update Version Metadata') {
+            when {
+                expression { currentBuild.currentResult == 'SUCCESS' }
+            }
+            steps {
+                script {
+                    try {
+                        def targetEnv = env.TARGET_ENV?.trim()
+                        echo "Updating version repository…"
+                        echo "Environment → ${targetEnv}"
+                        echo "Version     → ${env.NEW_VERSION}"
+
+                        def result = updateVersion(targetEnv, env.NEW_VERSION)
+                        echo "Project → ${result.project}"
+                    } catch (Exception e) {
+                        currentBuild.result = 'FAILURE'
+                        error("❌ Updating Version Repo failed: ${e.getMessage()}")
+                    }
+                }
+            }
+        }
+
+    } // end stages
+
+    /* ─────────────────────────── Post ─────────────────────────────────── */
+    post {
+        always {
+            script {
+
+                // Ownership revert logic
+                if (env.CONFIG_NAME?.trim() && env.OWNERSHIP_REVERT_CMD?.trim()) {
+                    try {
+                        sshPublisher(publishers: [
+                            sshPublisherDesc(
+                                configName: env.CONFIG_NAME,
+                                transfers: [
+                                    sshTransfer(
+                                        execCommand: "${env.OWNERSHIP_REVERT_CMD}",
+                                        execTimeout: env.EXECTIMEOUT?.trim() ? env.EXECTIMEOUT.toInteger() : 120000
+                                    )
+                                ],
+                                verbose: true
+                            )
+                        ])
+                    } catch (Exception e) {
+                        echo "⚠️ Ownership revert failed (non-blocking): ${e.getMessage()}"
+                    }
+                } else {
+                    echo "⚠️ Skipping ownership revert — CONFIG_NAME or OWNERSHIP_REVERT_CMD not resolved."
+                }
+
+                // HTML report publishing (SAFE CHECK ADDED)
+                if (fileExists('reports/index.html')) {
+                    publishHTML([
+                        reportDir: 'reports',
+                        reportFiles: 'index.html',
+                        reportName: 'Test Report',
+                        keepAll: true,
+                        alwaysLinkToLastBuild: true,
+                        allowMissing: true
+                    ])
+                } else {
+                    echo "⚠️ Skipping HTML report publish — reports/index.html not found."
+                }
+            }
+
+            cleanWs(patterns: [[pattern: 'dependency-check-report.xml', type: 'EXCLUDE']])
+        }
+    }
+}

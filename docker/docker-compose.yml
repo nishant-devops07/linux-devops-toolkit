@@ -1,0 +1,36 @@
+name: "Docker_TEST-0"
+
+services:
+  frontend:
+    container_name: "docker_test-ui"
+
+    image: "nexus:6767/test/dockerui-test:${IMAGE_TAG:-latest}"
+
+    ports:
+      - "3008:3000"
+
+    volumes:
+      - /opt/test/.env-ui:/app/.env
+      - /opt/test/config.ts:/app/src/lib/config.ts
+
+    networks:
+      - net
+
+    restart: always
+
+  backend:
+    container_name: "docker-api"
+
+    image: "nexus:9092/repository/test/docker_api:${IMAGE_TAG:-latest}"
+
+    network_mode: host
+
+    volumes:
+      - /opt/test/.env-api:/app/.env
+      - /opt/test/uploads:/app/public/upload
+
+    restart: always
+
+networks:
+  net:
+    driver: bridge
